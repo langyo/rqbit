@@ -48,14 +48,13 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context};
-use backoff::backoff::Backoff;
+use anyhow::{Context, bail};
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
 use librqbit_core::{
@@ -68,17 +67,17 @@ use librqbit_core::{
 };
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use peer_binary_protocol::{
-    extended::{
-        self, handshake::ExtendedHandshake, ut_metadata::UtMetadata, ut_pex::UtPex, ExtendedMessage,
-    },
     Handshake, Message, MessageOwned, Piece, Request,
+    extended::{
+        self, ExtendedMessage, handshake::ExtendedHandshake, ut_metadata::UtMetadata, ut_pex::UtPex,
+    },
 };
 use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     Notify, OwnedSemaphorePermit, Semaphore,
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, error_span, info, trace, warn, Instrument};
+use tracing::{Instrument, debug, error, error_span, info, trace, warn};
 
 use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
@@ -90,26 +89,26 @@ use crate::{
     session::CheckedIncomingConnection,
     session_stats::atomic::AtomicSessionStats,
     torrent_state::{peer::Peer, utils::atomic_inc},
-    type_aliases::{DiskWorkQueueSender, FilePriorities, FileStorage, PeerHandle, BF},
+    type_aliases::{BF, DiskWorkQueueSender, FilePriorities, FileStorage, PeerHandle},
 };
 
 use self::{
     peer::{
+        PeerRx, PeerState, PeerTx,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
         },
-        PeerRx, PeerState, PeerTx,
     },
     peers::PeerStates,
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
 };
 
 use super::{
+    ManagedTorrentShared, TorrentMetadata,
     paused::TorrentStatePaused,
     streaming::TorrentStreams,
-    utils::{timeit, TimedExistence},
-    ManagedTorrentShared, TorrentMetadata,
+    utils::{TimedExistence, timeit},
 };
 
 #[derive(Debug)]
@@ -312,7 +311,7 @@ impl TorrentStateLive {
                         state
                             .up_speed_estimator
                             .add_snapshot(stats.uploaded_bytes, None, now);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             },
@@ -400,9 +399,10 @@ impl TorrentStateLive {
                 "manage_incoming_peer",
                 addr = %checked_peer.addr
             ),
-            aframe!(self
-                .clone()
-                .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)),
+            aframe!(
+                self.clone()
+                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
+            ),
         );
         Ok(())
     }
@@ -472,7 +472,8 @@ impl TorrentStateLive {
                 rx,
                 checked_peer.read_buf,
                 checked_peer.handshake,
-                checked_peer.stream,
+                checked_peer.reader,
+                checked_peer.writer,
                 self.have_broadcast_tx.subscribe()
             ) => {r}
         };
@@ -529,12 +530,16 @@ impl TorrentStateLive {
             state.shared.spawner,
             state.shared.connector.clone(),
         );
-        let requester = aframe!(handler
-            .task_peer_chunk_requester()
-            .instrument(error_span!("chunk_requester")));
-        let conn_manager = aframe!(peer_connection
-            .manage_peer_outgoing(rx, state.have_broadcast_tx.subscribe())
-            .instrument(error_span!("peer_connection")));
+        let requester = aframe!(
+            handler
+                .task_peer_chunk_requester()
+                .instrument(error_span!("chunk_requester"))
+        );
+        let conn_manager = aframe!(
+            peer_connection
+                .manage_peer_outgoing(rx, state.have_broadcast_tx.subscribe())
+                .instrument(error_span!("peer_connection"))
+        );
 
         handler
             .counters
@@ -1181,12 +1186,15 @@ impl PeerHandler {
             return Ok(());
         }
 
-        let backoff = pe.value_mut().stats.backoff.next_backoff();
+        let backoff = pe.value_mut().stats.backoff.next();
 
         // Prevent deadlocks.
         drop(pe);
 
         if let Some(dur) = backoff {
+            if cfg!(feature = "_disable_reconnect_test") {
+                return Ok(());
+            }
             self.state.clone().spawn(
                 error_span!(
                     parent: self.state.shared.span.clone(),
@@ -1686,13 +1694,17 @@ impl PeerHandler {
             // While we hold per piece lock, noone can steal it.
             // So we can proceed writing knowing that the piece is ours now and will still be by the time
             // the write is finished.
-            match state.file_ops().write_chunk(addr, piece, chunk_info) {
-                Ok(()) => {}
-                Err(e) => {
-                    error!("FATAL: error writing chunk to disk: {e:#}");
-                    return state.on_fatal_error(e);
-                }
-            };
+            //
+
+            if !cfg!(feature = "_disable_disk_write_net_benchmark") {
+                match state.file_ops().write_chunk(addr, piece, chunk_info) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!("FATAL: error writing chunk to disk: {e:#}");
+                        return state.on_fatal_error(e);
+                    }
+                };
+            }
 
             let full_piece_download_time = {
                 let mut g = state.lock_write("mark_chunk_downloaded");
@@ -1773,7 +1785,7 @@ impl PeerHandler {
                     counters.on_piece_completed(piece_len, full_piece_download_time);
                     state.peers.reset_peer_backoff(addr);
 
-                    debug!("piece={} successfully downloaded and verified", index);
+                    trace!(piece = index, "successfully downloaded and verified");
 
                     state.on_piece_completed(chunk_info.piece_index)?;
 

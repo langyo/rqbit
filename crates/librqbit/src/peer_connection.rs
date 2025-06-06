@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
 use librqbit_core::{
@@ -14,15 +14,21 @@ use librqbit_core::{
 };
 use parking_lot::RwLock;
 use peer_binary_protocol::{
-    extended::{handshake::ExtendedHandshake, ExtendedMessage, PeerIP},
-    serialize_piece_preamble, Handshake, Message, MessageOwned, PIECE_MESSAGE_DEFAULT_LEN,
+    Handshake, Message, MessageOwned, PIECE_MESSAGE_DEFAULT_LEN,
+    extended::{ExtendedMessage, PeerIP, handshake::ExtendedHandshake},
+    serialize_piece_preamble,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tokio::time::timeout;
 use tracing::{debug, trace};
 
-use crate::{read_buf::ReadBuf, spawn_utils::BlockingSpawner, stream_connect::StreamConnector};
+use crate::{
+    read_buf::ReadBuf,
+    spawn_utils::BlockingSpawner,
+    stream_connect::StreamConnector,
+    type_aliases::{BoxAsyncRead, BoxAsyncWrite},
+};
 
 pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
@@ -53,7 +59,7 @@ pub enum WriterRequest {
 }
 
 #[serde_as]
-#[derive(Default, Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PeerConnectionOptions {
     #[serde_as(as = "Option<serde_with::DurationSeconds>")]
     pub connect_timeout: Option<Duration>,
@@ -126,7 +132,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         read_buf: ReadBuf,
         handshake: Handshake<ByteBufOwned>,
-        mut conn: tokio::net::TcpStream,
+        read: BoxAsyncRead,
+        mut write: BoxAsyncWrite,
         have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -152,7 +159,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let mut write_buf = Vec::<u8>::with_capacity(PIECE_MESSAGE_DEFAULT_LEN);
         let handshake = Handshake::new(self.info_hash, self.peer_id);
         handshake.serialize(&mut write_buf);
-        with_timeout(rwtimeout, conn.write_all(&write_buf))
+        with_timeout(rwtimeout, write.write_all(&write_buf))
             .await
             .context("error writing handshake")?;
         write_buf.clear();
@@ -160,8 +167,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let handshake_supports_extended = handshake.supports_extended();
 
         self.handler.on_handshake(handshake)?;
-
-        let (read, write) = conn.into_split();
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
@@ -336,6 +341,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     };
                 };
 
+                tokio::task::yield_now().await;
+
                 let mut uploaded_add = None;
 
                 trace!("about to send: {:?}", &req);
@@ -358,18 +365,20 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             use crate::tests::test_util::TestPeerMetadata;
                             let tpm = TestPeerMetadata::from_peer_id(self.peer_id);
                             use rand::Rng;
-                            if rand::thread_rng().gen_bool(tpm.disconnect_probability()) {
+                            if rand::rng().random_bool(tpm.disconnect_probability()) {
                                 bail!("disconnecting, to simulate failure in tests");
                             }
 
                             #[allow(clippy::cast_possible_truncation)]
-                            let sleep_ms = (rand::thread_rng().gen::<f64>()
+                            let sleep_ms = (rand::rng().random::<f64>()
                                 * (tpm.max_random_sleep_ms as f64))
                                 as u64;
                             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
 
-                            if rand::thread_rng().gen_bool(tpm.bad_data_probability()) {
-                                warn!("will NOT actually read the data to simulate a malicious peer that sends garbage");
+                            if rand::rng().random_bool(tpm.bad_data_probability()) {
+                                warn!(
+                                    "will NOT actually read the data to simulate a malicious peer that sends garbage"
+                                );
                                 write_buf.fill(0);
                                 skip_reading_for_e2e_tests = true;
                             }
@@ -420,6 +429,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     .context("error reading message")?;
                 trace!("received: {:?}", &message);
 
+                tokio::task::yield_now().await;
+
                 if let Message::Extended(ExtendedMessage::Handshake(h)) = &message {
                     *extended_handshake_ref.write() = Some(h.clone_to_owned(None));
                     self.handler.on_extended_handshake(h)?;
@@ -438,11 +449,19 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         tokio::select! {
             r = reader => {
-                trace!(result=?r, "reader is done, exiting");
+                if let Err(e) = r.as_ref() {
+                    trace!("reader finished with error: {e:#}");
+                } else {
+                    trace!("reader finished without error");
+                }
                 r
             }
             r = writer => {
-                trace!(result=?r, "writer is done, exiting");
+                if let Err(e) = r.as_ref() {
+                    trace!("writer finished with error: {e:#}");
+                } else {
+                    trace!("writer finished without error");
+                }
                 r
             }
         }

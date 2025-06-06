@@ -6,13 +6,13 @@ use bytes::Bytes;
 use librqbit_core::{
     constants::CHUNK_SIZE,
     hash_id::Id20,
-    lengths::{last_element_size, ChunkInfo},
+    lengths::{ChunkInfo, last_element_size},
     torrent_metainfo::TorrentMetaV1Info,
 };
 use parking_lot::{Mutex, RwLock};
 use peer_binary_protocol::{
-    extended::{handshake::ExtendedHandshake, ut_metadata::UtMetadata, ExtendedMessage},
     Handshake, Message,
+    extended::{ExtendedMessage, handshake::ExtendedHandshake, ut_metadata::UtMetadata},
 };
 use sha1w::{ISha1, Sha1};
 use tokio::sync::mpsc::UnboundedSender;
@@ -158,7 +158,9 @@ impl PeerConnectionHandler for Handler {
 
     fn on_handshake<B>(&self, handshake: Handshake<B>) -> anyhow::Result<()> {
         if !handshake.supports_extended() {
-            anyhow::bail!("this peer does not support extended handshaking, which is a prerequisite to download metadata")
+            anyhow::bail!(
+                "this peer does not support extended handshaking, which is a prerequisite to download metadata"
+            )
         }
         Ok(())
     }
@@ -240,47 +242,5 @@ impl PeerConnectionHandler for Handler {
 
     fn should_transmit_have(&self, _id: librqbit_core::lengths::ValidPieceIndex) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::{net::SocketAddr, str::FromStr, sync::Once};
-
-    use librqbit_core::hash_id::Id20;
-    use librqbit_core::peer_id::generate_peer_id;
-
-    use crate::spawn_utils::BlockingSpawner;
-
-    use super::read_metainfo_from_peer;
-
-    static LOG_INIT: Once = std::sync::Once::new();
-
-    fn init_logging() {
-        #[allow(unused_must_use)]
-        LOG_INIT.call_once(|| {
-            // pretty_env_logger::try_init();
-        })
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_torrent_metadata_from_localhost_bittorrent_client() {
-        init_logging();
-
-        let addr = SocketAddr::from_str("127.0.0.1:27311").unwrap();
-        let peer_id = generate_peer_id(b"-xx1234-");
-        let info_hash = Id20::from_str("9905f844e5d8787ecd5e08fb46b2eb0a42c131d7").unwrap();
-        dbg!(read_metainfo_from_peer(
-            addr,
-            peer_id,
-            info_hash,
-            None,
-            BlockingSpawner::new(true),
-            Arc::new(Default::default())
-        )
-        .await
-        .unwrap());
     }
 }

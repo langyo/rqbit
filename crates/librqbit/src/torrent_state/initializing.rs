@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -15,16 +15,16 @@ use size_format::SizeFormatterBinary as SF;
 use tracing::{info, trace, warn};
 
 use crate::{
+    FileInfos,
     api::TorrentIdOrHash,
     bitv::BitV,
     bitv_factory::BitVFactory,
     chunk_tracker::ChunkTracker,
     file_ops::FileOps,
-    type_aliases::{FileStorage, BF},
-    FileInfos,
+    type_aliases::{BF, FileStorage},
 };
 
-use super::{paused::TorrentStatePaused, ManagedTorrentShared, TorrentMetadata};
+use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
 
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
@@ -127,10 +127,10 @@ impl TorrentStateInitializing {
 
             // For all the remaining pieces we claim we have, validate them with decreasing probability.
             let mut queue = queue.iter_ones().collect_vec();
-            queue.shuffle(&mut rand::thread_rng());
+            queue.shuffle(&mut rand::rng());
             for (tmp_id, piece_id) in queue.into_iter().enumerate() {
                 let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
-                if rand::thread_rng().gen_ratio(1, denom) {
+                if rand::rng().random_ratio(1, denom) {
                     to_validate.set(piece_id, true);
                 }
             }
