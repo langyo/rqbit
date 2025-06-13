@@ -1,13 +1,13 @@
 // TODO: this now stores only the routing table, but we also need AT LEAST the same socket address...
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use librqbit_core::directories::get_configuration_directory;
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,8 @@ pub struct PersistentDhtConfig {
 struct DhtSerialize<Table, PeerStore> {
     addr: SocketAddr,
     table: Table,
+    // option for backwards compat
+    table_v6: Option<Table>,
     peer_store: Option<PeerStore>,
 }
 
@@ -46,12 +48,13 @@ fn dump_dht(dht: &Dht, filename: &Path, tempfile_name: &Path) -> anyhow::Result<
     let mut file = BufWriter::new(file);
 
     let addr = dht.listen_addr();
-    match dht.with_routing_table(|r| {
+    match dht.with_routing_tables(|v4, v6| {
         serde_json::to_writer(
             &mut file,
             &DhtSerialize {
                 addr,
-                table: r,
+                table: v4,
+                table_v6: Some(v6),
                 peer_store: Some(&dht.peer_store),
             },
         )
@@ -62,7 +65,7 @@ fn dump_dht(dht: &Dht, filename: &Path, tempfile_name: &Path) -> anyhow::Result<
         Err(e) => {
             return Err(e).with_context(|| {
                 format!("error serializing DHT routing table to {tempfile_name:?}")
-            })
+            });
         }
     }
 
@@ -105,8 +108,15 @@ impl PersistentDht {
                     match serde_json::from_reader::<_, DhtSerialize<RoutingTable, PeerStore>>(
                         reader,
                     ) {
-                        Ok(r) => {
+                        Ok(mut r) => {
                             info!(filename=?config_filename, "loaded DHT routing table from");
+                            if r.addr.ip() == Ipv4Addr::UNSPECIFIED {
+                                warn!(
+                                    "patching DHT listen IP address for rqbit 9 upgrade: 0.0.0.0 -> [::]"
+                                );
+                                r.addr.set_ip(Ipv6Addr::UNSPECIFIED.into());
+                            }
+
                             Some(r)
                         }
                         Err(e) => {
@@ -122,7 +132,8 @@ impl PersistentDht {
                 Err(e) => match e.kind() {
                     std::io::ErrorKind::NotFound => None,
                     _ => {
-                        return Err(e).with_context(|| format!("error reading {config_filename:?}"))
+                        return Err(e)
+                            .with_context(|| format!("error reading {config_filename:?}"));
                     }
                 },
             };
@@ -147,7 +158,7 @@ impl PersistentDht {
                     let dht = dht.clone();
                     let dump_interval = config
                         .dump_interval
-                        .unwrap_or_else(|| Duration::from_secs(3));
+                        .unwrap_or_else(|| Duration::from_secs(60));
                     async move {
                         let tempfile_name = {
                             let file_name = format!("dht.json.tmp.{}", std::process::id());

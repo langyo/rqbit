@@ -4,21 +4,21 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use base64::Engine;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use http::{HeaderMap, StatusCode};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, OnFailure};
-use tracing::{debug, error_span, info, Span};
+use tracing::{Span, debug, error_span, info};
 
 use axum::Router;
 
 use crate::api::Api;
 
-use crate::api::Result;
 use crate::ApiError;
+use crate::api::Result;
 
 mod handlers;
 mod timeout;
@@ -35,6 +35,10 @@ pub struct HttpApi {
 pub struct HttpApiOptions {
     pub read_only: bool,
     pub basic_auth: Option<(String, String)>,
+    // Allow creating torrents via API.
+    pub allow_create: bool,
+    #[cfg(feature = "prometheus")]
+    pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 async fn simple_basic_auth(
@@ -61,7 +65,7 @@ async fn simple_basic_auth(
                 StatusCode::UNAUTHORIZED,
                 [("WWW-Authenticate", "Basic realm=\"API\"")],
             )
-                .into_response())
+                .into_response());
         }
     };
     // TODO: constant time compare
@@ -83,10 +87,13 @@ impl HttpApi {
     /// If read_only is passed, no state-modifying methods will be exposed.
     #[inline(never)]
     pub fn make_http_api_and_run(
-        self,
+        mut self,
         listener: TcpListener,
         upnp_router: Option<Router>,
     ) -> BoxFuture<'static, anyhow::Result<()>> {
+        #[cfg(feature = "prometheus")]
+        let mut prometheus_handle = self.opts.prometheus_handle.take();
+
         let state = Arc::new(self);
 
         let mut main_router = handlers::make_api_router(state.clone());
@@ -98,6 +105,12 @@ impl HttpApi {
             let webui_router = webui::make_webui_router();
             main_router = main_router.nest("/web/", webui_router);
             main_router = main_router.route("/web", get(|| async { Redirect::permanent("./web/") }))
+        }
+
+        #[cfg(feature = "prometheus")]
+        if let Some(handle) = prometheus_handle.take() {
+            main_router =
+                main_router.route("/metrics", get(move || async move { handle.render() }));
         }
 
         let cors_layer = {

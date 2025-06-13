@@ -2,9 +2,9 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use buffers::ByteBufOwned;
-use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
-use tracing::{debug, error_span, Instrument};
+use tracing::{Instrument, debug, error_span};
 
 use crate::{
     peer_connection::PeerConnectionOptions, peer_info_reader, spawn_utils::BlockingSpawner,
@@ -13,6 +13,7 @@ use crate::{
 use librqbit_core::hash_id::Id20;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReadMetainfoResult<Rx> {
     Found {
         info: TorrentMetaV1Info<ByteBufOwned>,
@@ -138,7 +139,7 @@ mod tests {
             Vec::new(),
             peer_rx,
             None,
-            Arc::new(Default::default()),
+            Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
         )
         .await
         {
