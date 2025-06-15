@@ -16,8 +16,8 @@ use crate::{
     },
     session_stats::snapshot::SessionStatsSnapshot,
     torrent_state::{
-        peer::stats::snapshot::{PeerStatsFilter, PeerStatsSnapshot},
         FileStream, ManagedTorrentHandle,
+        peer::stats::snapshot::{PeerStatsFilter, PeerStatsSnapshot},
     },
 };
 
@@ -26,7 +26,7 @@ use crate::tracing_subscriber_config_utils::LineBroadcast;
 #[cfg(feature = "tracing-subscriber-utils")]
 use futures::Stream;
 #[cfg(feature = "tracing-subscriber-utils")]
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 pub use crate::torrent_state::stats::{LiveStats, TorrentStats};
 
@@ -353,9 +353,9 @@ impl Api {
         &self,
     ) -> Result<
         impl Stream<Item = std::result::Result<bytes::Bytes, BroadcastStreamRecvError>>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     > {
         Ok(self
             .line_broadcast
@@ -463,9 +463,19 @@ impl Api {
             .ok_or(ApiError::dht_disabled())
     }
 
-    pub fn api_dht_table(&self) -> Result<impl Serialize> {
+    pub fn api_dht_table(&self) -> Result<impl Serialize + use<>> {
         let dht = self.session.get_dht().ok_or(ApiError::dht_disabled())?;
-        Ok(dht.with_routing_table(|r| r.clone()))
+        Ok(dht.with_routing_tables(|v4, v6| {
+            #[derive(Serialize)]
+            struct Tables<T> {
+                v4: T,
+                v6: T,
+            }
+            Tables {
+                v4: v4.clone(),
+                v6: v6.clone(),
+            }
+        }))
     }
 
     pub fn api_stats_v0(&self, idx: TorrentIdOrHash) -> Result<LiveStats> {
@@ -566,9 +576,13 @@ fn make_torrent_details(
     Ok(TorrentDetailsResponse {
         id,
         info_hash: info_hash.as_string(),
-        name: name
-            .map(|s| s.to_owned())
-            .or_else(|| info.and_then(|i| i.name.as_ref().map(|b| b.to_string()))),
+        name: name.map(|s| s.to_owned()).or_else(|| {
+            info.and_then(|i| {
+                i.name
+                    .as_ref()
+                    .map(|b| String::from_utf8_lossy(b.as_ref()).into())
+            })
+        }),
         files: Some(files),
         output_folder,
         stats: None,

@@ -1,6 +1,6 @@
+use bencode::BencodeValue;
 use bencode::bencode_serialize_to_writer;
 use bencode::from_bytes;
-use bencode::BencodeValue;
 use buffers::ByteBufT;
 use bytes::Bytes;
 use clone_to_owned::CloneToOwned;
@@ -14,10 +14,6 @@ use self::{handshake::ExtendedHandshake, ut_metadata::UtMetadata};
 use super::MessageDeserializeError;
 
 pub mod handshake;
-mod ip;
-
-pub use ip::{PeerIP, PeerIP4, PeerIP6, PeerIPAny};
-
 pub mod ut_metadata;
 pub mod ut_pex;
 
@@ -102,17 +98,13 @@ impl<ByteBuf: ByteBufT> ExtendedMessage<ByteBuf> {
     where
         ByteBuf: Deserialize<'a> + From<&'a [u8]>,
     {
-        let emsg_id = buf.first().copied().ok_or_else(|| {
-            MessageDeserializeError::Other(anyhow::anyhow!(
-                "cannot deserialize extended message: can't read first byte"
-            ))
-        })?;
+        let emsg_id = buf.first().copied().ok_or(MessageDeserializeError::Text(
+            "cannot deserialize extended message: can't read first byte",
+        ))?;
 
-        buf = buf.get(1..).ok_or_else(|| {
-            MessageDeserializeError::Other(anyhow::anyhow!(
-                "cannot deserialize extended message: buffer empty"
-            ))
-        })?;
+        buf = buf.get(1..).ok_or(MessageDeserializeError::Text(
+            "cannot deserialize extended message: buffer empty",
+        ))?;
 
         match emsg_id {
             0 => Ok(ExtendedMessage::Handshake(from_bytes(buf)?)),

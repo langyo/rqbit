@@ -14,16 +14,17 @@ use anyhow::Context;
 use config::RqbitDesktopConfig;
 use http::StatusCode;
 use librqbit::{
+    AddTorrent, AddTorrentOptions, Api, ApiError, Session, SessionOptions,
+    SessionPersistenceConfig,
     api::{
         ApiAddTorrentResponse, EmptyJsonResponse, TorrentDetailsResponse, TorrentIdOrHash,
         TorrentListResponse, TorrentStats,
     },
     dht::PersistentDhtConfig,
     session_stats::snapshot::SessionStatsSnapshot,
-    tracing_subscriber_config_utils::{init_logging, InitLoggingOptions, InitLoggingResult},
-    AddTorrent, AddTorrentOptions, Api, ApiError, PeerConnectionOptions, Session, SessionOptions,
-    SessionPersistenceConfig,
+    tracing_subscriber_config_utils::{InitLoggingOptions, InitLoggingResult, init_logging},
 };
+use librqbit_dualstack_sockets::TcpListener;
 use parking_lot::RwLock;
 use serde::Serialize;
 use tracing::{error, error_span, info, warn};
@@ -83,6 +84,27 @@ async fn api_from_config(
             },
         })
     };
+
+    let (listen, connect) = config.connections.as_listener_and_connect_opts();
+
+    let mut http_api_opts = librqbit::http_api::HttpApiOptions {
+        read_only: config.http_api.read_only,
+        basic_auth: None,
+        ..Default::default()
+    };
+
+    // We need to start prometheus recorder earlier than session.
+    if !config.http_api.disable {
+        match metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder() {
+            Ok(handle) => {
+                http_api_opts.prometheus_handle = Some(handle);
+            }
+            Err(e) => {
+                warn!("error installting prometheus recorder: {e:#}");
+            }
+        }
+    }
+
     let session = Session::new_with_opts(
         config.default_download_location.clone(),
         SessionOptions {
@@ -93,17 +115,8 @@ async fn api_from_config(
                 ..Default::default()
             }),
             persistence,
-            peer_opts: Some(PeerConnectionOptions {
-                connect_timeout: Some(config.peer_opts.connect_timeout),
-                read_write_timeout: Some(config.peer_opts.read_write_timeout),
-                ..Default::default()
-            }),
-            listen_port_range: if !config.tcp_listen.disable {
-                Some(config.tcp_listen.min_port..config.tcp_listen.max_port)
-            } else {
-                None
-            },
-            enable_upnp_port_forwarding: !config.upnp.disable_tcp_port_forward,
+            connect: Some(connect),
+            listen,
             fastresume: config.persistence.fastresume,
             ratelimits: config.ratelimits,
             #[cfg(feature = "disable-upload")]
@@ -123,7 +136,6 @@ async fn api_from_config(
     if !config.http_api.disable {
         let listen_addr = config.http_api.listen_addr;
         let api = api.clone();
-        let read_only = config.http_api.read_only;
         let upnp_router = if config.upnp.enable_server {
             let friendly_name = config
                 .upnp
@@ -152,18 +164,11 @@ async fn api_from_config(
             None
         };
         let http_api_task = async move {
-            let listener = tokio::net::TcpListener::bind(listen_addr)
-                .await
+            let listener = TcpListener::bind_tcp(listen_addr, true)
                 .with_context(|| format!("error listening on {}", listen_addr))?;
-            librqbit::http_api::HttpApi::new(
-                api.clone(),
-                Some(librqbit::http_api::HttpApiOptions {
-                    read_only,
-                    basic_auth: None,
-                }),
-            )
-            .make_http_api_and_run(listener, upnp_router)
-            .await
+            librqbit::http_api::HttpApi::new(api.clone(), Some(http_api_opts))
+                .make_http_api_and_run(listener, upnp_router)
+                .await
         };
 
         session.spawn(error_span!("http_api"), http_api_task);
@@ -298,7 +303,7 @@ async fn torrent_create_from_base64_file(
     contents: String,
     opts: Option<AddTorrentOptions>,
 ) -> Result<ApiAddTorrentResponse, ApiError> {
-    use base64::{engine::general_purpose, Engine as _};
+    use base64::{Engine as _, engine::general_purpose};
     let bytes = general_purpose::STANDARD
         .decode(&contents)
         .context("invalid base64")

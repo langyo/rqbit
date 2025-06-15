@@ -1,49 +1,48 @@
 use std::{
     cmp::Reverse,
-    net::SocketAddr,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::FromStr,
     sync::{
-        atomic::{AtomicU16, Ordering},
         Arc,
+        atomic::{AtomicU16, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
 };
 
 use crate::{
+    INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
     bprotocol::{
-        self, AnnouncePeer, CompactNodeInfo, ErrorDescription, FindNodeRequest, GetPeersRequest,
-        Message, MessageKind, Node, PingRequest, Response,
+        self, AnnouncePeer, CompactNodeInfo, CompactNodeInfoOwned, ErrorDescription,
+        FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
     },
     peer_store::PeerStore,
     routing_table::{InsertResult, NodeStatus, RoutingTable},
-    INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
 };
-use anyhow::{bail, Context};
-use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
+use anyhow::{Context, bail};
+use backon::{ExponentialBuilder, Retryable};
 use bencode::ByteBufOwned;
 use dashmap::DashMap;
 use futures::{
-    future::BoxFuture, stream::FuturesUnordered, FutureExt, Stream, StreamExt, TryFutureExt,
+    FutureExt, Stream, StreamExt, TryFutureExt, future::BoxFuture, stream::FuturesUnordered,
 };
 
 use leaky_bucket::RateLimiter;
 use librqbit_core::{
+    compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     crate_version,
     hash_id::Id20,
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
 };
+use librqbit_dualstack_sockets::UdpSocket;
 use parking_lot::RwLock;
 
 use serde::Serialize;
-use tokio::{
-    net::UdpSocket,
-    sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, UnboundedSender},
-};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, debug_span, error, error_span, info, trace, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, error, error_span, info, trace, warn};
 
 #[derive(Debug, Serialize)]
 pub struct DhtStats {
@@ -51,6 +50,7 @@ pub struct DhtStats {
     pub id: Id20,
     pub outstanding_requests: usize,
     pub routing_table_size: usize,
+    pub routing_table_size_v6: usize,
 }
 
 struct OutstandingRequest {
@@ -133,16 +133,18 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
         if req.info_hash.distance(&target_node) > self.min_distance_to_announce {
             trace!(
                 "not announcing, {:?} is too far from {:?}",
-                target_node,
-                req.info_hash
+                target_node, req.info_hash
             );
             return;
         }
-        let (tid, message) = req.dht.create_request(Request::Announce {
-            info_hash: req.info_hash,
-            token: token.clone(),
-            port: announce_port,
-        });
+        let (tid, message) = req.dht.create_request(
+            Request::Announce {
+                info_hash: req.info_hash,
+                token: token.clone(),
+                port: announce_port,
+            },
+            addr,
+        );
 
         let _ = req.dht.worker_sender.send(WorkerSendRequest {
             our_tid: Some(tid),
@@ -155,7 +157,7 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
 struct RecursiveRequestCallbacksFindNodes {}
 impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
     fn on_request_start(&self, req: &RecursiveRequest<Self>, target_node: Id20, addr: SocketAddr) {
-        let mut rt = req.dht.routing_table.write();
+        let mut rt = req.dht.get_table_for_addr(addr).write();
         match rt.add_node(target_node, addr) {
             InsertResult::WasExisting | InsertResult::ReplacedBad(_) | InsertResult::Added => {
                 rt.mark_outgoing_request(&target_node);
@@ -168,10 +170,10 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
         &self,
         req: &RecursiveRequest<Self>,
         target_node: Id20,
-        _addr: SocketAddr,
+        addr: SocketAddr,
         resp: &anyhow::Result<ResponseOrError>,
     ) {
-        let mut table = req.dht.routing_table.write();
+        let mut table = req.dht.get_table_for_addr(addr).write();
         if resp.is_ok() {
             table.mark_response(&target_node);
         } else {
@@ -194,41 +196,50 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
 
 pub struct RequestPeersStream {
     rx: tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
-    cancel_join_handle: tokio::task::JoinHandle<()>,
+    cancel_join_handle_v4: tokio::task::JoinHandle<()>,
+    cancel_join_handle_v6: tokio::task::JoinHandle<()>,
 }
 
 impl RequestPeersStream {
     fn new(dht: Arc<DhtState>, info_hash: Id20, announce_port: Option<u16>) -> Self {
         let (peer_tx, peer_rx) = unbounded_channel();
-        let (node_tx, node_rx) = unbounded_channel();
-        let rp = Arc::new(RecursiveRequest {
-            max_depth: 4,
-            info_hash,
-            useful_nodes_limit: 256,
-            request: Request::GetPeers(info_hash),
-            dht,
-            useful_nodes: RwLock::new(Vec::new()),
-            peer_tx,
-            node_tx,
-            callbacks: RecursiveRequestCallbacksGetPeers {
-                min_distance_to_announce: Id20::from_str(
-                    "0000ffffffffffffffffffffffffffffffffffff",
-                )
-                .unwrap(),
-                announce_port,
-            },
-        });
-        let join_handle = rp.request_peers_forever(node_rx);
+        let make = |is_v4: bool, dht: Arc<DhtState>, peer_tx: UnboundedSender<SocketAddr>| {
+            let (node_tx, node_rx) = unbounded_channel();
+            let rp = Arc::new(RecursiveRequest {
+                max_depth: 4,
+                info_hash,
+                useful_nodes_limit: 256,
+                request: Request::GetPeers(info_hash),
+                dht,
+                useful_nodes: RwLock::new(Vec::new()),
+                peer_tx,
+                node_tx,
+                callbacks: RecursiveRequestCallbacksGetPeers {
+                    min_distance_to_announce: Id20::from_str(
+                        "0000ffffffffffffffffffffffffffffffffffff",
+                    )
+                    .unwrap(),
+                    announce_port,
+                },
+            });
+            rp.request_peers_forever(node_rx, is_v4)
+        };
+
+        let v4 = make(true, dht.clone(), peer_tx.clone());
+        let v6 = make(false, dht, peer_tx);
+
         Self {
             rx: peer_rx,
-            cancel_join_handle: join_handle,
+            cancel_join_handle_v4: v4,
+            cancel_join_handle_v6: v6,
         }
     }
 }
 
 impl Drop for RequestPeersStream {
     fn drop(&mut self) {
-        self.cancel_join_handle.abort();
+        self.cancel_join_handle_v4.abort();
+        self.cancel_join_handle_v6.abort();
     }
 }
 
@@ -325,10 +336,11 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
     fn request_peers_forever(
         self: &Arc<Self>,
         mut node_rx: tokio::sync::mpsc::UnboundedReceiver<(Option<Id20>, SocketAddr, usize)>,
+        is_v4: bool,
     ) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         spawn(
-            error_span!(parent: None, "get_peers", info_hash = format!("{:?}", self.info_hash)),
+            error_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
             async move {
                 let this = &this;
                 // Looper adds root nodes to the queue every 60 seconds.
@@ -337,7 +349,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                         let mut iteration = 0;
                         loop {
                             trace!("iteration {}", iteration);
-                            let sleep = match this.get_peers_root() {
+                            let sleep = match this.get_peers_root(is_v4) {
                                 Ok(0) => Duration::from_secs(1),
                                 Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
                                 Ok(_) => REQUERY_INTERVAL,
@@ -374,11 +386,14 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
         )
     }
 
-    fn get_peers_root(&self) -> anyhow::Result<usize> {
+    fn get_peers_root(&self, is_v4: bool) -> anyhow::Result<usize> {
         let mut count = 0;
-        for (id, addr) in self
-            .dht
-            .routing_table
+        let table = if is_v4 {
+            &self.dht.routing_table_v4
+        } else {
+            &self.dht.routing_table_v6
+        };
+        for (id, addr) in table
             .read()
             .sorted_by_distance_from(self.info_hash)
             .iter()
@@ -388,6 +403,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
             count += 1;
             self.node_tx.send((Some(id), addr, 0))?;
         }
+
         Ok(count)
     }
 }
@@ -425,25 +441,30 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
 
         if let Some(peers) = response.values {
             for peer in peers {
-                self.peer_tx.send(SocketAddr::V4(peer.addr))?;
+                self.peer_tx.send(peer.0)?;
             }
         }
 
-        if let Some(nodes) = response.nodes {
-            for node in nodes.nodes {
-                let addr = SocketAddr::V4(node.addr);
-                let should_request = self.should_request_node(node.id, addr, depth);
-                trace!(
-                    "should_request={}, id={:?}, addr={}, depth={}/{}",
-                    should_request,
-                    node.id,
-                    addr,
-                    depth,
-                    self.max_depth
-                );
-                if should_request {
-                    self.node_tx.send((Some(node.id), addr, depth + 1))?;
-                }
+        let node_it = response
+            .nodes
+            .iter()
+            .flat_map(|n| n.iter().map(|n| n.as_socketaddr()))
+            .chain(
+                response
+                    .nodes6
+                    .iter()
+                    .flat_map(|n| n.iter().map(|n| n.as_socketaddr())),
+            )
+            .filter(|node| addr.is_ipv4() == node.addr.is_ipv4());
+
+        for node in node_it {
+            let should_request = self.should_request_node(node.id, node.addr, depth);
+            trace!(
+                "should_request={}, id={:?}, addr={}, depth={}/{}",
+                should_request, node.id, node.addr, depth, self.max_depth
+            );
+            if should_request {
+                self.node_tx.send((Some(node.id), node.addr, depth + 1))?;
             }
         }
         Ok(())
@@ -539,7 +560,8 @@ pub struct DhtState {
     // If we get a response, it gets removed from here.
     inflight_by_transaction_id: DashMap<(u16, SocketAddr), OutstandingRequest>,
 
-    routing_table: RwLock<RoutingTable>,
+    routing_table_v4: RwLock<RoutingTable>,
+    routing_table_v6: RwLock<RoutingTable>,
     listen_addr: SocketAddr,
 
     // Sending requests to the worker.
@@ -556,17 +578,20 @@ impl DhtState {
     fn new_internal(
         id: Id20,
         sender: UnboundedSender<WorkerSendRequest>,
-        routing_table: Option<RoutingTable>,
+        routing_table_v4: Option<RoutingTable>,
+        routing_table_v6: Option<RoutingTable>,
         listen_addr: SocketAddr,
         peer_store: PeerStore,
         cancellation_token: CancellationToken,
     ) -> Self {
-        let routing_table = routing_table.unwrap_or_else(|| RoutingTable::new(id, None));
+        let routing_table_v4 = routing_table_v4.unwrap_or_else(|| RoutingTable::new(id, None));
+        let routing_table_v6 = routing_table_v6.unwrap_or_else(|| RoutingTable::new(id, None));
         Self {
             id,
             next_transaction_id: AtomicU16::new(0),
             inflight_by_transaction_id: Default::default(),
-            routing_table: RwLock::new(routing_table),
+            routing_table_v4: RwLock::new(routing_table_v4),
+            routing_table_v6: RwLock::new(routing_table_v6),
             worker_sender: sender,
             listen_addr,
             rate_limiter: make_rate_limiter(),
@@ -577,7 +602,7 @@ impl DhtState {
 
     async fn request(&self, request: Request, addr: SocketAddr) -> anyhow::Result<ResponseOrError> {
         self.rate_limiter.acquire_one().await;
-        let (tid, message) = self.create_request(request);
+        let (tid, message) = self.create_request(request, addr);
         let key = (tid, addr);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.inflight_by_transaction_id
@@ -611,9 +636,15 @@ impl DhtState {
         }
     }
 
-    fn create_request(&self, request: Request) -> (u16, Message<ByteBufOwned>) {
+    fn create_request(&self, request: Request, addr: SocketAddr) -> (u16, Message<ByteBufOwned>) {
         let transaction_id = self.next_transaction_id.fetch_add(1, Ordering::Relaxed);
         let transaction_id_buf = [(transaction_id >> 8) as u8, (transaction_id & 0xff) as u8];
+
+        let want = if addr.is_ipv6() {
+            Some(Want::V6)
+        } else {
+            Some(Want::V4)
+        };
 
         let message = match request {
             Request::GetPeers(info_hash) => Message {
@@ -623,6 +654,7 @@ impl DhtState {
                 kind: MessageKind::GetPeersRequest(GetPeersRequest {
                     id: self.id,
                     info_hash,
+                    want,
                 }),
             },
             Request::FindNode(target) => Message {
@@ -632,6 +664,7 @@ impl DhtState {
                 kind: MessageKind::FindNodeRequest(FindNodeRequest {
                     id: self.id,
                     target,
+                    want,
                 }),
             },
             Request::Ping => Message {
@@ -660,31 +693,66 @@ impl DhtState {
         (transaction_id, message)
     }
 
+    fn generate_compact_nodes_both(
+        &self,
+        target: Id20,
+        want: Want,
+    ) -> (
+        Option<CompactNodeInfoOwned<SocketAddrV4>>,
+        Option<CompactNodeInfoOwned<SocketAddrV6>>,
+    ) {
+        match want {
+            Want::V4 => (
+                Some(self.generate_compact_nodes(target, &self.routing_table_v4.read())),
+                None,
+            ),
+            Want::V6 => (
+                None,
+                Some(self.generate_compact_nodes(target, &self.routing_table_v6.read())),
+            ),
+            Want::Both => (
+                Some(self.generate_compact_nodes(target, &self.routing_table_v4.read())),
+                Some(self.generate_compact_nodes(target, &self.routing_table_v6.read())),
+            ),
+            Want::None => (None, None),
+        }
+    }
+
+    fn get_table_for_addr(&self, addr: SocketAddr) -> &RwLock<RoutingTable> {
+        if addr.is_ipv4() {
+            &self.routing_table_v4
+        } else {
+            &self.routing_table_v6
+        }
+    }
+
+    fn generate_compact_nodes<A>(
+        &self,
+        target: Id20,
+        table: &RoutingTable,
+    ) -> CompactNodeInfo<ByteBufOwned, A>
+    where
+        A: CompactSerialize + CompactSerializeFixedLen + FromSocketAddr,
+        Node<A>: CompactSerialize + CompactSerializeFixedLen,
+    {
+        let it = table
+            .sorted_by_distance_from(target)
+            .into_iter()
+            .filter_map(|r| {
+                Some(Node {
+                    id: r.id(),
+                    addr: A::from_socket_addr(r.addr())?,
+                })
+            })
+            .take(8);
+        CompactNodeInfo::new_from_iter(it)
+    }
+
     fn on_received_message(
         self: &Arc<Self>,
         msg: Message<ByteBufOwned>,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        let generate_compact_nodes = |target| {
-            let nodes = self
-                .routing_table
-                .read()
-                .sorted_by_distance_from(target)
-                .into_iter()
-                .filter_map(|r| {
-                    Some(Node {
-                        id: r.id(),
-                        addr: match r.addr() {
-                            SocketAddr::V4(v4) => v4,
-                            SocketAddr::V6(_) => return None,
-                        },
-                    })
-                })
-                .take(8)
-                .collect::<Vec<_>>();
-            CompactNodeInfo { nodes }
-        };
-
         match &msg.kind {
             // If it's a response to a request we made, find the request task, notify it with the response,
             // and let it handle it.
@@ -728,13 +796,15 @@ impl DhtState {
                 let message = Message {
                     transaction_id: msg.transaction_id,
                     version: None,
-                    ip: None,
+                    ip: Some(addr),
                     kind: MessageKind::Response(bprotocol::Response {
                         id: self.id,
                         ..Default::default()
                     }),
                 };
-                self.routing_table.write().mark_last_query(&req.id);
+                self.get_table_for_addr(addr)
+                    .write()
+                    .mark_last_query(&req.id);
                 self.worker_sender.send(WorkerSendRequest {
                     our_tid: None,
                     message,
@@ -743,13 +813,15 @@ impl DhtState {
                 Ok(())
             }
             MessageKind::AnnouncePeer(ann) => {
-                self.routing_table.write().mark_last_query(&ann.id);
+                self.get_table_for_addr(addr)
+                    .write()
+                    .mark_last_query(&ann.id);
                 let added = self.peer_store.store_peer(ann, addr);
                 trace!("{addr}: added_peer={added}, announce={ann:?}");
                 let message = Message {
                     transaction_id: msg.transaction_id,
                     version: None,
-                    ip: None,
+                    ip: Some(addr),
                     kind: MessageKind::Response(bprotocol::Response {
                         id: self.id,
                         ..Default::default()
@@ -763,16 +835,22 @@ impl DhtState {
                 Ok(())
             }
             MessageKind::GetPeersRequest(req) => {
-                let compact_node_info = generate_compact_nodes(req.info_hash);
-                let compact_peer_info = self.peer_store.get_for_info_hash(req.info_hash);
-                self.routing_table.write().mark_last_query(&req.id);
+                let want = req
+                    .want
+                    .unwrap_or(if addr.is_ipv6() { Want::V6 } else { Want::V4 });
+                let (nodes, nodes6) = self.generate_compact_nodes_both(req.info_hash, want);
+                let compact_peer_info = self.peer_store.get_for_info_hash(req.info_hash, want);
+                self.get_table_for_addr(addr)
+                    .write()
+                    .mark_last_query(&req.id);
                 let message = Message {
                     transaction_id: msg.transaction_id,
                     version: None,
-                    ip: None,
+                    ip: Some(addr),
                     kind: MessageKind::Response(bprotocol::Response {
                         id: self.id,
-                        nodes: Some(compact_node_info),
+                        nodes,
+                        nodes6,
                         values: Some(compact_peer_info),
                         token: Some(ByteBufOwned::from(
                             &self.peer_store.gen_token_for(req.id, addr)[..],
@@ -787,15 +865,21 @@ impl DhtState {
                 Ok(())
             }
             MessageKind::FindNodeRequest(req) => {
-                let compact_node_info = generate_compact_nodes(req.target);
-                self.routing_table.write().mark_last_query(&req.id);
+                let want = req
+                    .want
+                    .unwrap_or(if addr.is_ipv6() { Want::V6 } else { Want::V4 });
+                let (nodes, nodes6) = self.generate_compact_nodes_both(req.target, want);
+                self.get_table_for_addr(addr)
+                    .write()
+                    .mark_last_query(&req.id);
                 let message = Message {
                     transaction_id: msg.transaction_id,
                     version: None,
-                    ip: None,
+                    ip: Some(addr),
                     kind: MessageKind::Response(bprotocol::Response {
                         id: self.id,
-                        nodes: Some(compact_node_info),
+                        nodes,
+                        nodes6,
                         ..Default::default()
                     }),
                 };
@@ -814,7 +898,8 @@ impl DhtState {
         DhtStats {
             id: self.id,
             outstanding_requests: self.inflight_by_transaction_id.len(),
-            routing_table_size: self.routing_table.read().len(),
+            routing_table_size: self.routing_table_v4.read().len(),
+            routing_table_size_v6: self.routing_table_v6.read().len(),
         }
     }
 }
@@ -862,36 +947,41 @@ impl DhtWorker {
     async fn bootstrap_hostname(&self, hostname: &str) -> anyhow::Result<()> {
         let addrs = tokio::net::lookup_host(hostname)
             .await
-            .with_context(|| format!("error looking up {}", hostname))?;
-        RecursiveRequest::find_node_for_routing_table(self.dht.clone(), self.dht.id, addrs).await
+            .with_context(|| format!("error looking up {}", hostname))?
+            .collect::<Vec<_>>();
+        let v4 = RecursiveRequest::find_node_for_routing_table(
+            self.dht.clone(),
+            self.dht.id,
+            addrs.iter().copied().filter(|a| a.is_ipv4()),
+        )
+        .instrument(error_span!("v4"));
+
+        let v6 = RecursiveRequest::find_node_for_routing_table(
+            self.dht.clone(),
+            self.dht.id,
+            addrs.iter().copied().filter(|a| a.is_ipv6()),
+        )
+        .instrument(error_span!("v6"));
+
+        let (v4, v6) = tokio::join!(v4, v6);
+        v4.or(v6)
     }
 
     async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> anyhow::Result<()> {
-        let mut backoff = ExponentialBackoffBuilder::new()
-            .with_initial_interval(Duration::from_secs(10))
-            .with_multiplier(1.5)
-            .with_max_interval(Duration::from_secs(60))
-            .with_max_elapsed_time(Some(Duration::from_secs(86400)))
-            .build();
+        let backoff = ExponentialBuilder::new()
+            .with_max_delay(Duration::from_secs(60))
+            .with_jitter()
+            .with_total_delay(Some(Duration::from_secs(86400)))
+            .without_max_times();
 
-        loop {
-            let backoff = match self
-                .bootstrap_hostname(addr)
-                .instrument(error_span!("bootstrap", hostname = addr))
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    warn!("error: {}", e);
-                    backoff.next_backoff()
-                }
-            };
-            if let Some(backoff) = backoff {
-                tokio::time::sleep(backoff).await;
-                continue;
-            }
-            bail!("bootstrap failed")
-        }
+        (|| self.bootstrap_hostname(addr))
+            .retry(backoff)
+            .notify(|error, retry_in| {
+                warn!(?retry_in, "error in bootstrap: {error:#}");
+            })
+            .instrument(error_span!("bootstrap", hostname = addr))
+            .await
+            .context("bootstrap failed")
     }
 
     async fn bootstrap(&self, bootstrap_addrs: &[String]) -> anyhow::Result<()> {
@@ -912,8 +1002,14 @@ impl DhtWorker {
         Ok(())
     }
 
-    async fn bucket_refresher(&self) -> anyhow::Result<()> {
+    async fn bucket_refresher(&self, is_v4: bool) -> anyhow::Result<()> {
         let (tx, mut rx) = unbounded_channel();
+
+        let table = if is_v4 {
+            &self.dht.routing_table_v4
+        } else {
+            &self.dht.routing_table_v6
+        };
 
         let mut futs = FuturesUnordered::new();
         let filler = async {
@@ -923,7 +1019,8 @@ impl DhtWorker {
             loop {
                 interval.tick().await;
                 let mut found = 0;
-                for bucket in self.dht.routing_table.read().iter_buckets() {
+
+                for bucket in table.read().iter_buckets() {
                     if bucket.leaf.last_refreshed.elapsed() < INACTIVITY_TIMEOUT {
                         continue;
                     }
@@ -943,9 +1040,7 @@ impl DhtWorker {
                 _ = &mut filler => {},
                 random_id = rx.recv() => {
                     let random_id = random_id.unwrap();
-                    let addrs = self
-                        .dht
-                        .routing_table
+                    let addrs = table
                         .read()
                         .sorted_by_distance_from(random_id)
                         .iter()
@@ -962,7 +1057,12 @@ impl DhtWorker {
         }
     }
 
-    async fn pinger(&self) -> anyhow::Result<()> {
+    async fn pinger(&self, is_v4: bool) -> anyhow::Result<()> {
+        let table = if is_v4 {
+            &self.dht.routing_table_v4
+        } else {
+            &self.dht.routing_table_v6
+        };
         let mut futs = FuturesUnordered::new();
         let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT / 4);
         let (tx, mut rx) = unbounded_channel();
@@ -971,9 +1071,10 @@ impl DhtWorker {
             loop {
                 interval.tick().await;
                 let mut found = 0;
-                for node in self.dht.routing_table.read().iter() {
+                let now = Instant::now();
+                for node in table.read().iter() {
                     if matches!(
-                        node.status(),
+                        node.status(now),
                         NodeStatus::Questionable | NodeStatus::Unknown
                     ) {
                         found += 1;
@@ -993,13 +1094,13 @@ impl DhtWorker {
                 r = rx.recv() => {
                     let (id, addr) = r.unwrap();
                     futs.push(async move {
-                        self.dht.routing_table.write().mark_outgoing_request(&id);
+                        table.write().mark_outgoing_request(&id);
                         match self.dht.request(Request::Ping, addr).await {
                             Ok(_) => {
-                                self.dht.routing_table.write().mark_response(&id);
+                                table.write().mark_response(&id);
                             },
                             Err(e) => {
-                                self.dht.routing_table.write().mark_error(&id);
+                                table.write().mark_error(&id);
                                 debug!("error: {e:#}");
                             }
                         }
@@ -1101,16 +1202,23 @@ impl DhtWorker {
         }
         .instrument(debug_span!("dht_responese_reader"));
 
-        let pinger = self.pinger().instrument(error_span!("pinger"));
-        let bucket_refresher = self
-            .bucket_refresher()
-            .instrument(error_span!("bucket_refresher"));
+        let pinger_v4 = self.pinger(true).instrument(error_span!("pinger_v4"));
+        let bucket_refresher_v4 = self
+            .bucket_refresher(true)
+            .instrument(error_span!("bucket_refresher_v4"));
+
+        let pinger_v6 = self.pinger(false).instrument(error_span!("pinger_v6"));
+        let bucket_refresher_v6 = self
+            .bucket_refresher(false)
+            .instrument(error_span!("bucket_refresher_v6"));
 
         tokio::pin!(framer);
         tokio::pin!(bootstrap);
         tokio::pin!(response_reader);
-        tokio::pin!(pinger);
-        tokio::pin!(bucket_refresher);
+        tokio::pin!(pinger_v4);
+        tokio::pin!(bucket_refresher_v4);
+        tokio::pin!(pinger_v6);
+        tokio::pin!(bucket_refresher_v6);
 
         loop {
             tokio::select! {
@@ -1121,11 +1229,17 @@ impl DhtWorker {
                     bootstrap_done = true;
                     result?;
                 },
-                err = &mut pinger => {
-                    anyhow::bail!("pinger quit: {:?}", err)
+                err = &mut pinger_v4 => {
+                    anyhow::bail!("pinger_v4 quit: {:?}", err)
                 },
-                err = &mut bucket_refresher => {
-                    anyhow::bail!("bucket_refresher quit: {:?}", err)
+                err = &mut bucket_refresher_v4 => {
+                    anyhow::bail!("bucket_refresher_v4 quit: {:?}", err)
+                },
+                err = &mut pinger_v6 => {
+                    anyhow::bail!("pinger_v6 quit: {:?}", err)
+                },
+                err = &mut bucket_refresher_v6 => {
+                    anyhow::bail!("bucket_refresher_v6 quit: {:?}", err)
                 },
                 err = &mut response_reader => {anyhow::bail!("response reader quit: {:?}", err)}
             }
@@ -1138,6 +1252,7 @@ pub struct DhtConfig {
     pub peer_id: Option<Id20>,
     pub bootstrap_addrs: Option<Vec<String>>,
     pub routing_table: Option<RoutingTable>,
+    pub routing_table_v6: Option<RoutingTable>,
     pub listen_addr: Option<SocketAddr>,
     pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
@@ -1154,18 +1269,12 @@ impl DhtState {
     #[inline(never)]
     pub fn with_config(mut config: DhtConfig) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
         async move {
-            let socket = match config.listen_addr {
-                Some(addr) => UdpSocket::bind(addr)
-                    .await
-                    .with_context(|| format!("error binding socket, address {addr}")),
-                None => UdpSocket::bind("0.0.0.0:0")
-                    .await
-                    .context("error binding socket, address 0.0.0.0:0"),
-            }?;
+            let addr = config
+                .listen_addr
+                .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
+            let socket = UdpSocket::bind_udp(addr, true).context("error binding UDP socket")?;
 
-            let listen_addr = socket
-                .local_addr()
-                .context("cannot determine UDP listen addr")?;
+            let listen_addr = socket.bind_addr();
             info!("DHT listening on {:?}", listen_addr);
 
             let peer_id = config
@@ -1183,6 +1292,7 @@ impl DhtState {
                 peer_id,
                 in_tx,
                 config.routing_table,
+                config.routing_table_v6,
                 listen_addr,
                 config.peer_store.unwrap_or_else(|| PeerStore::new(peer_id)),
                 token,
@@ -1216,11 +1326,33 @@ impl DhtState {
         self.get_stats()
     }
 
-    pub fn with_routing_table<R, F: FnOnce(&RoutingTable) -> R>(&self, f: F) -> R {
-        f(&self.routing_table.read())
+    pub fn with_routing_tables<R, F: FnOnce(&RoutingTable, &RoutingTable) -> R>(&self, f: F) -> R {
+        f(&self.routing_table_v4.read(), &self.routing_table_v6.read())
     }
 
-    pub fn clone_routing_table(&self) -> RoutingTable {
-        self.routing_table.read().clone()
+    // pub fn clone_routing_table(&self) -> RoutingTable {
+    //     self.routing_table.read().clone()
+    // }
+}
+
+trait FromSocketAddr: Sized {
+    fn from_socket_addr(addr: SocketAddr) -> Option<Self>;
+}
+
+impl FromSocketAddr for SocketAddrV4 {
+    fn from_socket_addr(addr: SocketAddr) -> Option<Self> {
+        match addr {
+            SocketAddr::V4(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+
+impl FromSocketAddr for SocketAddrV6 {
+    fn from_socket_addr(addr: SocketAddr) -> Option<Self> {
+        match addr {
+            SocketAddr::V6(a) => Some(a),
+            _ => None,
+        }
     }
 }
